@@ -7,8 +7,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 runs.jsonl
-generated_domains/
-generated_tools/
 .env
 *.env
 .env/
