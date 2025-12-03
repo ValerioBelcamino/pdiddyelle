@@ -1,0 +1,14 @@
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.DS_Store
+runs.jsonl
+generated_domains/
+generated_tools/
+.env
+*.env
+.env/
