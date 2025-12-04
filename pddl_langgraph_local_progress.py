@@ -433,6 +433,7 @@ def run_planner(
         temp_idx = 0
 
         start_time = time.perf_counter()
+        error_count = 0
         for step in range(args.max_steps):
             response = agent(messages, dynamic_temp, dynamic_seed)
             messages.append(response)
@@ -507,11 +508,29 @@ def run_planner(
 
             if plan_lines:
                 plan_lines.pop()
+            error_count += 1
             err = f"VAL status={status} rc={rc}\nstdout:{stdout}\nstderr:{stderr}"
-            messages.append(HumanMessage(content=err))
+            # Use progressor to recover last good prefix/problem.
+            plan_text_full = plan_lines_to_text(plan_lines)
+            prog_result = validate_plan_text(
+                domain_text=domain_text,
+                problem_text=problem_text_local,
+                plan_text=plan_text_full,
+                timeout=args.validate_timeout,
+                val_bin_dir=validate_path.parent,
+            )
+            prefix_lines = strip_plan_prefix(prog_result.good_plan_prefix) if prog_result.good_plan_prefix else []
+            if prog_result.updated_problem_text:
+                problem_text_local = prog_result.updated_problem_text
+            messages, plan_lines = rebuild_state(prefix_lines, problem_text_local, err)
+
             temp_idx = min(temp_idx + 1, len(temp_schedule) - 1) if args.grow_temperature else temp_idx
             dynamic_temp = temp_schedule[temp_idx] if args.grow_temperature else dynamic_temp + 1.0
             dynamic_seed = int(time.time() * 1000) % 10_000_000
+
+            if step + 1 >= args.max_steps or error_count >= args.max_errors:
+                log("[warn] reached stopping condition (steps or errors)")
+                break
 
         total_time = time.perf_counter() - start_time
 
@@ -621,6 +640,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True, help="Local HF model path/name.")
     parser.add_argument("--device", default="auto", help="Device map for HF model (e.g., auto, cpu, cuda:0).")
     parser.add_argument("--max-steps", type=int, default=50, help="Max agent/tool iterations.")
+    parser.add_argument("--max-errors", type=int, default=5, help="Max validation errors before stopping an attempt.")
     parser.add_argument("--validate-path", help="Path to VAL Validate binary.")
     parser.add_argument("--validate-timeout", type=int, default=30, help="Validate timeout seconds.")
     parser.add_argument("--max-attempts", type=int, default=5, help="Maximum validate/replan attempts per problem.")
