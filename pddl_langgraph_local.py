@@ -505,6 +505,11 @@ def run_planner(
             if error_category == "goal_not_satisfied":
                 if action == "end" and plan_lines:
                     plan_lines.pop()
+                    messages.append(
+                        HumanMessage(
+                            content="Goal not reached; do not call END yet. Continue planning with a single tool call."
+                        )
+                    )
                 continue
 
             if plan_lines:
