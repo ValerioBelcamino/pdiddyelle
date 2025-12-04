@@ -38,8 +38,8 @@ DEFAULT_VALIDATE_PATH = (
 )
 
 AGENT_SYSTEM_PROMPT = """You are a PDDL planning router that must emit plan steps via tools.
-- One tool call per turn.
-- Output must be exactly one line: "action param1 param2" or "end". No prose, bullets, or explanations.
+- One tool call per turn (native tool_calls or a JSON code block with {"tool_calls": [{"name": "...", "arguments": {...}}]}).
+- Do NOT return prose; return only the tool call. No plain text plans, no bullets.
 - Use the tool names exactly as given and keep argument order.
 - Use the END tool when the goal is satisfied."""
 
@@ -440,14 +440,28 @@ def run_planner(
             tool_call, plan_line = coerce_tool_call(response, tool_meta)
             action = plan_line.split()[0].lower() if plan_line else ""
 
+            # Execute tool if available; otherwise use normalized plan line.
+            tool_output = plan_line
+            tool_obj = next((t for t in tools if getattr(t, "name", "") == tool_call["name"]), None)
+            if tool_obj:
+                try:
+                    res = tool_obj.invoke(tool_call.get("args", {}))
+                    if isinstance(res, ToolMessage):
+                        tool_output = str(res.content)
+                    else:
+                        tool_output = str(res)
+                except Exception as exc:  # best-effort; fall back to plan_line
+                    tool_output = plan_line
+                    log(f"[tool error] {exc}")
+
             messages.append(
                 ToolMessage(
-                    content=plan_line,
+                    content=tool_output,
                     name=tool_call["name"],
                     tool_call_id=tool_call["id"],
                 )
             )
-            plan_lines.append(plan_line)
+            plan_lines.append(tool_output)
 
             status, stdout, stderr, rc = run_validate(
                 domain_text=domain_text,
@@ -457,6 +471,12 @@ def run_planner(
                 timeout=args.validate_timeout,
             )
             error_category = classify_val_error(status, stdout, stderr)
+            # If the model immediately ended and validation failed, treat as goal not reached.
+            if action == "end" and len(plan_lines) == 1 and status != "valid":
+                error_category = "goal_not_satisfied"
+            stdout_brief = stdout.strip().splitlines()[:2]
+            stderr_brief = stderr.strip().splitlines()[:2]
+            brief = " | ".join(filter(None, ["; ".join(stdout_brief), "; ".join(stderr_brief)]))
             if status == "valid":
                 val_summary = "ok:passed"
             elif error_category == "goal_not_satisfied":
@@ -577,7 +597,7 @@ def load_dataset(dataset_path: Path) -> List[Dict[str, str]]:
 
 
 def extract_domain_name(domain_text: str) -> Optional[str]:
-    match = re.search(r"\\(domain\\s+([^\\s)]+)", domain_text, flags=re.IGNORECASE)
+    match = re.search(r"\(domain\s+([^\s)]+)", domain_text, flags=re.IGNORECASE)
     if match:
         return match.group(1).lower()
     return None
