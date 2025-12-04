@@ -1,3 +1,7 @@
+"""
+vLLM-friendly LangGraph planner that keeps dataset iteration, VAL validation,
+and retry logic while being tolerant to non-JSON tool calling.
+"""
 import argparse
 import importlib.util
 import json
@@ -6,19 +10,15 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional, Tuple, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
+from uuid import uuid4
 
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from partial_plan_validator import validate_plan_text
 
@@ -39,7 +39,8 @@ DEFAULT_VALIDATE_PATH = (
 AGENT_SYSTEM_PROMPT = """You are a PDDL planning router that must emit plan steps via tools.
 - Call one tool per step to build the plan in order.
 - Use the tool names exactly as given. Each tool call should correspond to a single plan line: "action param1 param2".
-- Use the END tool to finish when goals are achieved."""
+- Use the END tool to finish when goals are achieved.
+- If JSON/tool calling is unavailable, reply with exactly one line: either "action param1 param2" or "end", no explanations."""
 
 
 class PlannerState(TypedDict):
@@ -85,7 +86,6 @@ def build_tools(module) -> List:
         if name in seen:
             continue
         if name == "end":
-            # We'll add a single universal end below.
             seen.add(name)
             continue
         description = fn.get("description", "")
@@ -100,17 +100,211 @@ def build_tools(module) -> List:
 
             return _dynamic
 
-        tools.append(make_tool(name, description, required))
+        dynamic_tool = make_tool(name, description, required)
+        setattr(dynamic_tool, "_pddl_required_params", required)
+        tools.append(dynamic_tool)
         seen.add(name)
 
-    # Universal END tool
-    if "end" not in seen:
-        @tool("end", description="Signal the plan is complete and stop emitting further actions.")
-        def end_tool():
-            return "end"
+    @tool("end", description="Signal the plan is complete and stop emitting further actions.")
+    def end_tool():
+        return "end"
 
-        tools.append(end_tool)
+    setattr(end_tool, "_pddl_required_params", [])
+    tools.append(end_tool)
     return tools
+
+
+def build_tool_metadata(tools: List) -> Dict[str, Dict[str, Any]]:
+    """Create a lookup of tool names to required parameter order."""
+    meta: Dict[str, Dict[str, Any]] = {}
+    for tool in tools:
+        name = getattr(tool, "name", getattr(tool, "__name__", "")).strip()
+        if not name:
+            continue
+        required = list(getattr(tool, "_pddl_required_params", []))
+        meta[name.lower()] = {"name": name, "required": required}
+    return meta
+
+
+def _tokens_to_args(required_params: List[str], tokens: List[str]) -> Dict[str, str]:
+    args: Dict[str, str] = {}
+    for idx, param in enumerate(required_params):
+        args[param] = tokens[idx] if idx < len(tokens) else ""
+    if tokens and len(tokens) > len(required_params) and required_params:
+        args[required_params[-1]] = " ".join(tokens[len(required_params) - 1 :])
+    return args
+
+
+def parse_tool_call_text(text: str, tool_meta: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Parse a free-form line like `move a b` into a tool call dict."""
+    if not text:
+        return None
+
+    def from_json_block(raw: str) -> Optional[Dict[str, Any]]:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get("name")
+        if not name and isinstance(obj.get("function"), dict):
+            name = obj["function"].get("name")
+            obj_args = obj["function"].get("arguments") or obj["function"].get("args", {})
+        else:
+            obj_args = obj.get("arguments") or obj.get("args", {})
+        if not name:
+            return None
+        meta = tool_meta.get(str(name).lower())
+        if not meta:
+            return None
+        args: Dict[str, str] = {}
+        if isinstance(obj_args, dict):
+            args = {param: str(obj_args.get(param, "")) for param in meta.get("required", [])}
+        elif isinstance(obj_args, str):
+            args = _tokens_to_args(meta.get("required", []), obj_args.split())
+        else:
+            args = _tokens_to_args(meta.get("required", []), [])
+        return {"name": meta["name"], "args": args}
+
+    def parse_tokens(tokens: List[str]) -> Optional[Dict[str, Any]]:
+        if not tokens:
+            return None
+        action_key = tokens[0].lower()
+        meta = tool_meta.get(action_key)
+        if not meta:
+            return None
+        args_tokens = tokens[1:]
+        args = _tokens_to_args(meta.get("required", []), args_tokens)
+        return {"name": meta["name"], "args": args}
+
+    def clean_line(raw_line: str) -> str:
+        line = raw_line.strip()
+        if not line:
+            return line
+        line = re.sub(r"^[\-*\d\.]+\s*", "", line)
+        if ":" in line:
+            prefix, rest = line.split(":", 1)
+            if prefix.strip().lower() in {"action", "tool", "step", "call"}:
+                line = rest.strip()
+        if line.startswith("`") and line.endswith("`"):
+            line = line[1:-1].strip()
+        if line.startswith("(") and line.endswith(")"):
+            line = line[1:-1].strip()
+        line = re.sub(r"</?[^>]+>", "", line)  # strip simple XML-ish tags
+        return line
+
+    # Prefer fenced code blocks if present
+    fenced_blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", text, flags=re.DOTALL)
+    for block in fenced_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        json_candidate = block
+        parsed_json = from_json_block(json_candidate)
+        if parsed_json:
+            return parsed_json
+        for raw_line in block.splitlines():
+            candidate = clean_line(raw_line)
+            parsed = parse_tokens(candidate.split())
+            if parsed:
+                return parsed
+
+    # XML-like blocks
+    xml_blocks = re.findall(r"<tool_call[^>]*>(.*?)</tool_call>", text, flags=re.DOTALL | re.IGNORECASE)
+    for block in xml_blocks:
+        block = block.strip()
+        parsed_json = from_json_block(block)
+        if parsed_json:
+            return parsed_json
+        for raw_line in block.splitlines():
+            candidate = clean_line(raw_line)
+            parsed = parse_tokens(candidate.split())
+            if parsed:
+                return parsed
+
+    for raw_line in text.splitlines():
+        candidate = clean_line(raw_line)
+        parsed = parse_tokens(candidate.split())
+        if parsed:
+            return parsed
+
+    json_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if json_match:
+        parsed_json = from_json_block(json_match.group(0))
+        if parsed_json:
+            return parsed_json
+
+    condensed = re.sub(r"\s+", " ", text).strip()
+    for key, meta in tool_meta.items():
+        match = re.search(rf"\b{re.escape(key)}\b", condensed, flags=re.IGNORECASE)
+        if not match:
+            continue
+        tail = condensed[match.end() :].strip()
+        parsed = parse_tokens([key] + tail.split())
+        if parsed:
+            return parsed
+    return None
+
+
+def coerce_tool_call_message(
+    response: AIMessage, tool_meta: Dict[str, Dict[str, Any]], allow_fallback: bool = True
+) -> AIMessage:
+    """Ensure the LLM response always contains a usable tool call."""
+    if not isinstance(response, AIMessage):
+        raise TypeError(f"Expected AIMessage from model, got {type(response)}")
+
+    existing_calls = list(getattr(response, "tool_calls", []) or [])
+    for call in existing_calls:
+        name = call.get("name") or call.get("function", {}).get("name")
+        if not name:
+            continue
+        meta = tool_meta.get(name.lower())
+        if not meta:
+            continue
+        raw_args = call.get("args")
+        if raw_args is None and isinstance(call.get("function"), dict):
+            raw_args = call["function"].get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except Exception:
+                raw_args = raw_args.strip()
+        if isinstance(raw_args, dict):
+            args = {param: str(raw_args.get(param, "")) for param in meta.get("required", [])}
+        elif isinstance(raw_args, str):
+            args = _tokens_to_args(meta.get("required", []), raw_args.split())
+        else:
+            args = _tokens_to_args(meta.get("required", []), [])
+        response.tool_calls = [
+            {
+                "name": meta["name"],
+                "args": args,
+                "id": call.get("id") or f"call_{uuid4().hex}",
+                "type": call.get("type") or "tool_call",
+            }
+        ]
+        response.content = ""
+        return response
+
+    parsed = parse_tool_call_text(str(response.content or ""), tool_meta) if allow_fallback else None
+    if not parsed:
+        end_meta = tool_meta.get("end")
+        if end_meta:
+            parsed = {"name": end_meta["name"], "args": {}}
+        else:
+            raise ValueError("Model did not return a tool call and no tool could be parsed from text.")
+
+    response.tool_calls = [
+        {
+            "name": parsed["name"],
+            "args": parsed.get("args", {}),
+            "id": f"call_{uuid4().hex}",
+            "type": "tool_call",
+        }
+    ]
+    response.content = ""
+    return response
 
 
 def run_validate(
@@ -207,40 +401,25 @@ def build_graph(
     max_steps: int,
     validate_mode: str = "per-step",
     max_failures_per_step: int = 3,
+    tool_calling_mode: str = "auto",
+    tool_meta: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
-    return _build_graph(
-        tools=tools,
-        llm=llm,
-        validate_path=validate_path,
-        domain_text=domain_text,
-        problem_text=problem_text,
-        validate_timeout=validate_timeout,
-        max_steps=max_steps,
-        validate_mode=validate_mode,
-        max_failures_per_step=max_failures_per_step,
-    )
-
-
-def _build_graph(
-    tools: List,
-    llm: ChatOpenAI,
-    validate_path: Path,
-    domain_text: str,
-    problem_text: str,
-    validate_timeout: int,
-    max_steps: int,
-    validate_mode: str,
-    max_failures_per_step: int,
-):
+    tool_meta = tool_meta or build_tool_metadata(tools)
     tool_node = ToolNode(tools)
 
     def agent(state: PlannerState):
         messages = state["messages"]
-        # Force tool-only responses to avoid free-form text.
-        response = llm.bind_tools(tools, tool_choice="required").invoke(messages)
-        if getattr(response, "tool_calls", None):
-            response.content = ""
-        return {"messages": [response], "steps": state["steps"] + 1}
+        response = None
+        if tool_calling_mode in {"auto", "json"}:
+            try:
+                response = llm.bind_tools(tools, tool_choice="required").invoke(messages)
+            except Exception:
+                if tool_calling_mode == "json":
+                    raise
+        if response is None:
+            response = llm.invoke(messages)
+        coerced = coerce_tool_call_message(response, tool_meta, allow_fallback=True)
+        return {"messages": [coerced], "steps": state["steps"] + 1}
 
     def accumulate(state: PlannerState):
         plan_lines = list(state["plan_lines"])
@@ -251,7 +430,6 @@ def _build_graph(
             content = str(msg.content).strip()
             if not content:
                 continue
-            # Treat 'end' specially.
             action = content.split()[0].lower() if content else ""
             last_action = action
             if action != "end":
@@ -260,7 +438,6 @@ def _build_graph(
 
     def validate(state: PlannerState):
         if validate_mode == "final" and state.get("last_action") != "end":
-            # Skip validation until end is requested.
             return {
                 "last_error": None,
                 "last_status": "pending",
@@ -284,7 +461,6 @@ def _build_graph(
             validate_path=validate_path,
             timeout=validate_timeout,
         )
-        current_len = len(state["plan_lines"])
         prev_streak = state.get("fail_streak", 0)
         if status == "valid":
             first_try = prev_streak == 0
@@ -298,7 +474,7 @@ def _build_graph(
 
         streak = prev_streak + 1
         error_category = classify_val_error(status, stdout, stderr)
-        trimmed_err = f"VAL status={status} rc={rc}\\nstdout:{stdout}\\nstderr:{stderr}"
+        trimmed_err = f"VAL status={status} rc={rc}\nstdout:{stdout}\nstderr:{stderr}"
         return {
             "messages": [HumanMessage(content=trimmed_err)],
             "plan_lines": state["plan_lines"],
@@ -350,7 +526,7 @@ def extract_domain_name(domain_text: str) -> Optional[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a LangGraph tool-calling planner with VAL validation.")
+    parser = argparse.ArgumentParser(description="LangGraph tool-calling planner with VAL validation (vLLM-friendly).")
     parser.add_argument("--domain-file", required=True, help="Path to PDDL domain file.")
     parser.add_argument("--problem-file", help="Path to PDDL problem file.")
     parser.add_argument("--dataset", help="Optional dataset (instruction/input/output) JSON; uses --index to select problem.")
@@ -361,9 +537,9 @@ def main() -> None:
         help="If set, iterate through dataset from --index onward, skipping non-matching domains.",
     )
     parser.add_argument("--tools", help="Path to generated tools module; defaults to generated_tools/<domain>_tools.py")
-    parser.add_argument("--model", default=None, help="Model name (overrides DEEPSEEK_MODEL or .env).")
-    parser.add_argument("--base-url", default=None, help="API base URL (overrides DEEPSEEK_API_BASE or .env).")
-    parser.add_argument("--api-key", help="API key (falls back to DEEPSEEK_API_KEY or OPENAI_API_KEY).")
+    parser.add_argument("--model", default=None, help="Model name (defaults to VLLM_MODEL or 'local-vllm').")
+    parser.add_argument("--base-url", default=None, help="API base URL (defaults to VLLM_API_BASE or http://localhost:8000/v1).")
+    parser.add_argument("--api-key", help="API key (defaults to VLLM_API_KEY or 'not-needed').")
     parser.add_argument("--validate-path", help="Path to VAL Validate binary.")
     parser.add_argument("--validate-timeout", type=int, default=30, help="Validate timeout seconds.")
     parser.add_argument("--max-steps", type=int, default=50, help="Max agent/tool iterations.")
@@ -410,16 +586,21 @@ def main() -> None:
         action="store_true",
         help="If set, increase temperature per retry (0,1,2,4,6).",
     )
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
+    parser.add_argument(
+        "--tool-calling",
+        choices=["auto", "json", "text"],
+        default="auto",
+        help="Tool calling strategy: json forces OpenAI/tool schema, text expects plain 'action arg1 arg2' for local models, auto tries json then falls back.",
+    )
     parser.add_argument("--env-file", default=".env", help="Path to .env file.")
     args = parser.parse_args()
 
     load_env_file(args.env_file)
 
-    api_key = args.api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("Set DEEPSEEK_API_KEY/OPENAI_API_KEY or provide --api-key.")
-    model = args.model or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
-    base_url = args.base_url or os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
+    api_key = args.api_key or os.getenv("VLLM_API_KEY") or "not-needed"
+    model = args.model or os.getenv("VLLM_MODEL") or "local-vllm"
+    base_url = args.base_url or os.getenv("VLLM_API_BASE", "http://localhost:8000/v1")
 
     domain_path = Path(args.domain_file)
     if not domain_path.exists():
@@ -449,6 +630,7 @@ def main() -> None:
         raise SystemExit(f"Tools module not found: {tools_path}")
     tools_module = load_tools_module(tools_path)
     tools = build_tools(tools_module)
+    tool_meta = build_tool_metadata(tools)
 
     validate_path = Path(args.validate_path) if args.validate_path else DEFAULT_VALIDATE_PATH
     if not validate_path.exists():
@@ -469,6 +651,7 @@ def main() -> None:
 
     validate_mode = "final" if args.final_validate else args.validate_mode
     recursion_limit = args.recursion_limit
+    tool_calling_mode = args.tool_calling
 
     output_path: Optional[Path] = Path(args.output) if args.output else None
     if output_path:
@@ -493,6 +676,8 @@ def main() -> None:
             max_steps=args.max_steps,
             validate_mode=validate_mode,
             max_failures_per_step=args.max_failures_per_step,
+            tool_calling_mode=tool_calling_mode,
+            tool_meta=tool_meta,
         )
 
         prefix_lines = prefix_lines or []
@@ -518,23 +703,15 @@ def main() -> None:
         }
 
         start_time = time.perf_counter()
-        last_step_time = start_time
-        step_durations: List[float] = []
         current_plan_lines: List[str] = []
 
         for event in graph.stream(state, config={"recursion_limit": recursion_limit}):
             if args.verbose:
                 print(event)
-            if "agent" in event:
-                now = time.perf_counter()
-                step_durations.append(now - last_step_time)
-                last_step_time = now
             if "accumulate" in event and "plan_lines" in event["accumulate"]:
                 current_plan_lines = event["accumulate"]["plan_lines"]
 
         total_time = time.perf_counter() - start_time
-        total_steps = len(step_durations)
-        avg_step_time = sum(step_durations) / total_steps if total_steps else 0.0
 
         plan_text = plan_lines_to_text(current_plan_lines)
         val_result = validate_plan_text(
@@ -549,12 +726,10 @@ def main() -> None:
         print(f"Domain: {domain_name}")
         if dataset_label_local:
             print(f"Dataset: {dataset_label_local}")
-        print(f"Steps: {total_steps}")
+        print(f"Steps: {len(current_plan_lines)}")
         print(f"Plan length (lines): {len(current_plan_lines)}")
         print(f"Total time: {total_time:.2f}s")
-        print(f"Avg time per step: {avg_step_time:.2f}s")
         print(f"Validation status: {val_result.status}")
-        print(f"Executed instructions: {val_result.executed_instructions}")
         if val_result.good_plan_prefix:
             print("Good prefix:")
             print(val_result.good_plan_prefix.strip())
@@ -566,12 +741,11 @@ def main() -> None:
                 "domain": domain_name,
                 "dataset": dataset_label_local,
                 "validate_mode": validate_mode,
-                "steps": total_steps,
+                "steps": len(current_plan_lines),
                 "plan_length": len(current_plan_lines),
                 "plan_lines": current_plan_lines,
                 "plan_text": plan_text,
                 "total_time_sec": total_time,
-                "avg_step_time_sec": avg_step_time,
                 "validation_status": val_result.status,
                 "executed_instructions": val_result.executed_instructions,
                 "good_plan_prefix": val_result.good_plan_prefix,
@@ -591,9 +765,8 @@ def main() -> None:
         feedback: Optional[str] = None
         for attempt in range(1, max_attempts + 1):
             seed = int(time.time() * 1000) % 10_000_000
-            temperature = 0.0
+            temperature = args.temperature
             if args.grow_temperature:
-                # Schedule: 0,1,2,4,6 for attempts 1..5, then cap at 6.
                 temp_schedule = [0, 1, 2, 4, 6]
                 idx = min(attempt, len(temp_schedule)) - 1
                 temperature = float(temp_schedule[idx])
