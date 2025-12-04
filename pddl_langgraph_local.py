@@ -38,10 +38,10 @@ DEFAULT_VALIDATE_PATH = (
 )
 
 AGENT_SYSTEM_PROMPT = """You are a PDDL planning router that must emit plan steps via tools.
-- One tool call per turn (native tool_calls or a JSON code block with {"tool_calls": [{"name": "...", "arguments": {...}}]}).
-- Do NOT return prose; return only the tool call. No plain text plans, no bullets.
+- Exactly ONE tool call per turn (either native tool_calls or a single JSON code block with exactly one entry).
+- Do NOT return prose or plain text plans. No lists, no bullets, no multiple tool calls.
 - Use the tool names exactly as given and keep argument order.
-- Use the END tool when the goal is satisfied."""
+- Use the END tool only when the goal is satisfied."""
 
 
 # ---------------------------------------------------------------------------
@@ -434,9 +434,19 @@ def run_planner(
         temp_idx = 0
 
         start_time = time.perf_counter()
-        for step in range(args.max_steps):
+        step = 0
+        while step < args.max_steps:
             response = agent(messages, dynamic_temp, dynamic_seed)
             messages.append(response)
+            tool_calls_raw = list(getattr(response, "tool_calls", []) or [])
+            if tool_calls_raw and len(tool_calls_raw) != 1:
+                messages.append(
+                    HumanMessage(
+                        content="Error: you must return exactly ONE tool call per turn. Resend with a single tool call."
+                    )
+                )
+                continue
+
             tool_call, plan_line = coerce_tool_call(response, tool_meta)
             action = plan_line.split()[0].lower() if plan_line else ""
 
@@ -462,6 +472,7 @@ def run_planner(
                 )
             )
             plan_lines.append(tool_output)
+            step += 1
 
             status, stdout, stderr, rc = run_validate(
                 domain_text=domain_text,
@@ -648,6 +659,13 @@ def main() -> None:
         raise SystemExit("Provide either --problem-file or --dataset with --index (or use --scan-all).")
 
     domain_name = extract_domain_name(domain_text) or domain_path.stem.lower()
+    if problem_text_single:
+        problem_domain = extract_domain_name(problem_text_single)
+        if problem_domain and domain_name and problem_domain != domain_name:
+            raise SystemExit(
+                f"Domain mismatch: domain file='{domain_name}' vs problem domain='{problem_domain}'. "
+                "Choose a dataset/problem that matches the domain."
+            )
     tools_path = Path(args.tools) if args.tools else Path("generated_tools") / f"{domain_name}_tools.py"
     if not tools_path.exists():
         raise SystemExit(f"Tools module not found: {tools_path}")
