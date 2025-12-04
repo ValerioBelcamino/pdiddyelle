@@ -504,6 +504,7 @@ def run_planner(
                             content="Goal not reached; do not call END yet. Continue planning with a single tool call."
                         )
                     )
+                dynamic_seed = int(time.time() * 1000) % 10_000_000
                 continue
 
             if plan_lines:
